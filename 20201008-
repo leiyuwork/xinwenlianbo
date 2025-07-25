@@ -1,0 +1,112 @@
+import requests
+from bs4 import BeautifulSoup
+from datetime import datetime
+import pandas as pd
+import time
+import csv
+import os
+import threading
+from concurrent.futures import ThreadPoolExecutor
+
+# 配置项
+SAVE_PATH = r"C:\Users\y\OneDrive\Research\PHD\Research\data\context analysis\xinwenlianbo20201008-"
+CSV_FILE = os.path.join(SAVE_PATH, 'xinwenlianbo_merged.csv')
+SUCCESS_LOG = os.path.join(SAVE_PATH, 'log_success.txt')
+ERROR_LOG = os.path.join(SAVE_PATH, 'log_error.txt')
+
+HEADERS = {
+    'Accept': 'text/html, */*; q=0.01',
+    'Referer': 'http://tv.cctv.com/lm/xwlb/',
+    'X-Requested-With': 'XMLHttpRequest',
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/71.0.3578.98 Safari/537.36',
+}
+
+lock = threading.Lock()
+
+# 日期生成器
+def datelist(beginDate, endDate):
+    return [datetime.strftime(x, '%Y%m%d') for x in pd.date_range(start=beginDate, end=endDate)]
+
+# 访问并获取某一天所有新闻链接
+def fetch_links(date):
+    try:
+        url = f'http://tv.cctv.com/lm/xwlb/day/{date}.shtml'
+        resp = requests.get(url, headers=HEADERS, timeout=10)
+        resp.raise_for_status()
+        soup = BeautifulSoup(resp.text, 'lxml')
+        lis = soup.find_all('li')
+        return [li.find('a')['href'] for li in lis if li.find('a')]
+    except Exception as e:
+        with lock:
+            with open(ERROR_LOG, 'a', encoding='utf-8') as f:
+                f.write(f"{date}: failed to fetch links - {e}\n")
+        return []
+
+# 解析新闻页面，提取标题、日期和正文
+def parse_article(url, retries=3):
+    for attempt in range(retries):
+        try:
+            resp = requests.get(url, headers=HEADERS, timeout=10)
+            resp.encoding = resp.apparent_encoding
+            soup = BeautifulSoup(resp.text, 'lxml')
+
+            # 标题
+            title = soup.find('title').get_text(strip=True)
+
+            # 日期
+            pubdate_tag = soup.find('span', class_='info')
+            pubdate = pubdate_tag.get_text(strip=True) if pubdate_tag else ''
+
+            # 正文
+            content_tag = soup.find('div', id='content_area')
+            if not content_tag:
+                content_tag = soup.find('div', id='content_body')
+            if not content_tag:
+                content_tag = soup.find('div', class_='cnt_bd')
+            text = content_tag.get_text(strip=True, separator='\n') if content_tag else ''
+
+            return title, pubdate, text
+        except Exception as e:
+            time.sleep(1)
+            continue
+    with lock:
+        with open(ERROR_LOG, 'a', encoding='utf-8') as f:
+            f.write(f"{url}: failed to parse after {retries} retries\n")
+    return None
+
+# 写入 CSV（逐条写）
+def write_to_csv(row):
+    with lock:
+        with open(CSV_FILE, 'a', newline='', encoding='utf-8-sig') as f:
+            writer = csv.writer(f)
+            writer.writerow(row)
+
+# 主函数：抓取某一天的所有新闻
+def process_date(date):
+    links = fetch_links(date)
+    if not links:
+        return
+    for link in links[1:]:  # 跳过第一条（为头条容器页）
+        result = parse_article(link)
+        if result:
+            title, pubdate, text = result
+            write_to_csv([date, title, pubdate, link, text])
+            with lock:
+                with open(SUCCESS_LOG, 'a', encoding='utf-8') as f:
+                    f.write(f"{date} - {title} OK\n")
+
+# 初始化（写入表头）
+def initialize():
+    if not os.path.exists(SAVE_PATH):
+        os.makedirs(SAVE_PATH)
+    if not os.path.exists(CSV_FILE):
+        with open(CSV_FILE, 'w', newline='', encoding='utf-8-sig') as f:
+            writer = csv.writer(f)
+            writer.writerow(['Date', 'Title', 'Publish Date', 'URL', 'Content'])
+
+# 运行
+if __name__ == '__main__':
+    initialize()
+    dates = datelist('20250602', '20250714')
+    with ThreadPoolExecutor(max_workers=5) as executor:
+        executor.map(process_date, dates)
