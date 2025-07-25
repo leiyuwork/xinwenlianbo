@@ -1,0 +1,192 @@
+import requests
+import csv
+import time
+import os
+import threading
+import concurrent.futures
+from datetime import date, timedelta
+from bs4 import BeautifulSoup
+from urllib.parse import urljoin
+
+# === 配置 (针对 2010-2011 年任务更新) ===
+BASE_DIR = r"C:\Users\y\OneDrive\Research\PHD\Research\data\context analysis\new"
+# 更新了CSV文件名
+CSV_FILE = os.path.join(BASE_DIR, "xwlb_20100508-20110405.csv")
+SUCCESS_LOG = os.path.join(BASE_DIR, "log_success_2010-2011.txt")
+ERROR_LOG = os.path.join(BASE_DIR, "log_error_2010-2011.txt")
+
+HEADERS = {
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:109.0) Gecko/20100101 Firefox/115.0',
+    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+    'Accept-Encoding': 'gzip, deflate',
+    'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
+    'Connection': 'keep-alive',
+    'Referer': 'http://news.cntv.cn/',  # Referer也更新一下
+}
+
+# --- 多线程配置 ---
+MAX_WORKERS = 20
+
+# --- 其他配置 (更新了日期和URL模板) ---
+START_DATE = date(2010, 5, 8)
+END_DATE = date(2011, 4, 5)
+# (*** 已更新 ***) URL模板的域名已更改为 news.cntv.cn
+DAILY_URL_TEMPLATE = 'http://news.cntv.cn/program/xwlb/{}.shtml'
+
+# 全局锁 (功能保留)
+file_lock = threading.Lock()
+
+
+# --- 函数定义 ---
+
+def log_message(filepath, message):
+    """线程安全的日志记录函数 (功能保留)"""
+    with file_lock:
+        with open(filepath, 'a', encoding='utf-8') as f:
+            f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} - {message}\n")
+
+
+def get_html_content(url, encoding='gbk'):
+    """(*** 编码更新 ***) 获取指定URL的HTML内容，此版网页编码为gbk"""
+    try:
+        response = requests.get(url, headers=HEADERS, timeout=60)
+        response.raise_for_status()
+        # (*** 已更新 ***) 根据HTML <meta> 标签, 编码是 gbk
+        response.encoding = encoding
+        return response.text
+    except requests.exceptions.RequestException as e:
+        print(f"[ERROR] 访问失败: {url}, 原因: {e}")
+        return None
+
+
+def parse_article_content(html_content):
+    """
+    (*** 已更新 ***)
+    从新闻详情页HTML中解析出正文文本, 适配 2010-2011 版页面结构。
+    """
+    if not html_content:
+        return None
+    soup = BeautifulSoup(html_content, 'lxml')
+
+    # 1. 定位到包含正文的主 <div id="content_body">
+    content_div = soup.find('div', id='content_body')
+
+    if not content_div:
+        return None  # 如果找不到主容器，直接返回失败
+
+    # 2. 从主容器中提取所有 <p> 标签的文本
+    paragraphs = content_div.find_all('p')
+
+    full_text = []
+    for p in paragraphs:
+        # 过滤掉空的<p>标签, 包含"责编："或编辑署名的行
+        # 同时过滤掉末尾的编辑信息行
+        align_attr = p.get('align', '').lower()
+        text = p.get_text(strip=True)
+
+        if text and '责编：' not in text and align_attr != 'right':
+            full_text.append(text)
+
+    return '\n'.join(full_text) if full_text else None
+
+
+def scrape_day(current_date):
+    """
+    爬取指定日期的所有新闻条目。
+    (*** 列表页解析逻辑与上一版几乎一致，无需大改 ***)
+    """
+    date_str = current_date.strftime("%Y%m%d")
+    daily_list_url = DAILY_URL_TEMPLATE.format(date_str)
+
+    print(f"[开始处理] 日期: {date_str}")
+
+    html = get_html_content(daily_list_url)  # 使用默认gbk编码
+    if not html:
+        log_message(ERROR_LOG, f"日期列表页访问失败: {daily_list_url}")
+        return (date_str, 0, 0)
+
+    soup = BeautifulSoup(html, 'lxml')
+
+    # 列表页结构与上一版相同，选择器依然有效
+    list_box = soup.find('div', class_='title_list_box')
+    article_links = list_box.find_all('a') if list_box else []
+
+    if not article_links:
+        msg = f"在 {daily_list_url} 未找到任何新闻链接。该日可能无数据。"
+        log_message(ERROR_LOG, msg)
+        return (date_str, 0, 0)
+
+    success_count = 0
+    error_count = 0
+
+    for link in article_links:
+        title = link.text.strip()
+        article_url = link.get('href')
+
+        if not title or not article_url:
+            continue
+
+        # 详情页的编码也是gbk
+        article_html = get_html_content(article_url)
+        content = "error"
+
+        if article_html:
+            # 使用更新后的详情页解析函数
+            parsed_text = parse_article_content(article_html)
+            if parsed_text:
+                content = parsed_text
+                log_message(SUCCESS_LOG, f"成功解析: {title} ({article_url})")
+                success_count += 1
+            else:
+                log_message(ERROR_LOG, f"内容解析失败: {title} ({article_url})")
+                error_count += 1
+        else:
+            log_message(ERROR_LOG, f"详情页访问失败: {title} ({article_url})")
+            error_count += 1
+
+        # 线程安全地写入文件 (功能保留)
+        with file_lock:
+            with open(CSV_FILE, 'a', newline='', encoding='utf-8-sig') as f:
+                writer = csv.writer(f)
+                writer.writerow([date_str, title, article_url, content])
+
+    print(f"[处理完毕] 日期: {date_str}, 成功: {success_count}, 失败: {error_count}")
+    return (date_str, success_count, error_count)
+
+
+# --- 主程序 (功能保留) ---
+def main():
+    """脚本主入口，使用线程池执行任务"""
+    os.makedirs(BASE_DIR, exist_ok=True)
+
+    if not os.path.exists(CSV_FILE):
+        with open(CSV_FILE, 'w', newline='', encoding='utf-8-sig') as f:
+            writer = csv.writer(f)
+            writer.writerow(['日期', '标题', 'URL', '正文'])
+
+    dates_to_process = []
+    current_date = START_DATE
+    while current_date <= END_DATE:
+        dates_to_process.append(current_date)
+        current_date += timedelta(days=1)
+
+    print(f"--- 任务开始 (2010-2011) ---")
+    print(f"总计需要处理 {len(dates_to_process)} 天的数据。")
+    print(f"使用 {MAX_WORKERS} 个线程并发处理。")
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+        results = executor.map(scrape_day, dates_to_process)
+        # 简化统计逻辑
+        total_success = sum(r[1] for r in results if r)
+        total_error = sum(r[2] for r in results if r)
+
+    print(f"\n--- 所有任务执行完毕 ---")
+    print(f"总计成功抓取文章: {total_success}")
+    print(f"总计失败条目: {total_error}")
+    print(f"数据已保存至: {CSV_FILE}")
+    print(f"成功日志: {SUCCESS_LOG}")
+    print(f"错误日志: {ERROR_LOG}")
+
+
+if __name__ == '__main__':
+    main()
