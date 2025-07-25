@@ -1,0 +1,108 @@
+import requests
+from bs4 import BeautifulSoup
+from datetime import datetime, timedelta
+import os
+import csv
+import time
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import chardet
+
+# === 配置路径 ===
+SAVE_PATH = r"C:\Users\y\OneDrive\Research\PHD\Research\data\context analysis\xinwenlianbo20160203-20201007"
+CSV_FILE = os.path.join(SAVE_PATH, 'xinwenlianbo_20160203-20201007.csv')
+SUCCESS_LOG = os.path.join(SAVE_PATH, 'log_success.txt')
+ERROR_LOG = os.path.join(SAVE_PATH, 'log_error.txt')
+HEADERS = {
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115.0.0.0 Safari/537.36',
+}
+
+# 控制调试信息打印
+DEBUG = False
+
+lock = threading.Lock()
+
+# === 日期生成器 ===
+def datelist(start, end):
+    return [(start + timedelta(days=i)).strftime('%Y%m%d') for i in range((end - start).days + 1)]
+
+# === 获取每日新闻链接和标题（含自动编码识别）
+def fetch_titles(date, retries=3):
+    url = f'https://tv.cctv.com/lm/xwlb/day/{date}.shtml'
+    results = []
+
+    for attempt in range(retries):
+        try:
+            resp = requests.get(url, headers=HEADERS, timeout=20)
+            resp.raise_for_status()
+
+            # 自动检测编码
+            detected = chardet.detect(resp.content)
+            encoding = detected['encoding'] or 'utf-8'
+            if DEBUG:
+                print(f"[{date}] Detected encoding: {encoding}")
+            resp.encoding = encoding
+
+            soup = BeautifulSoup(resp.text, 'html.parser')
+            lis = soup.find_all('li')
+            for li in lis:
+                a = li.find('a')
+                if a and a.text.strip() and any(domain in a['href'] for domain in ['cntv.cn', 'tv.cctv.com']):
+                    title_clean = a.text.strip()
+                    results.append({
+                        'title': title_clean,
+                        'url': a['href'].strip(),
+                        'status': 'success' if a['href'].startswith('http') else 'invalid_url'
+                    })
+            return results
+        except Exception as e:
+            if attempt == retries - 1:
+                with lock:
+                    with open(ERROR_LOG, 'a', encoding='utf-8') as f:
+                        f.write(f"{url}\n")
+            time.sleep(1)
+    return []
+
+# === 写入CSV
+def write_to_csv(rows):
+    with lock:
+        with open(CSV_FILE, 'a', newline='', encoding='utf-8-sig') as f:
+            writer = csv.writer(f)
+            for row in rows:
+                writer.writerow([str(cell) for cell in row])
+
+# === 处理一天的任务
+def process_date(date):
+    items = fetch_titles(date)
+    rows = []
+    for item in items:
+        rows.append([date, item['title'], item['url'], item['status']])
+    if rows:
+        write_to_csv(rows)
+        with lock:
+            with open(SUCCESS_LOG, 'a', encoding='utf-8') as f:
+                f.write(f"{date}\n")
+    time.sleep(0.5)
+
+# === 初始化文件
+def initialize():
+    os.makedirs(SAVE_PATH, exist_ok=True)
+    if not os.path.exists(CSV_FILE):
+        with open(CSV_FILE, 'w', newline='', encoding='utf-8-sig') as f:
+            writer = csv.writer(f)
+            writer.writerow(['Date', 'Title', 'URL', 'Status'])
+
+# === 主执行
+if __name__ == '__main__':
+    initialize()
+    start_date = datetime.strptime('20160225', '%Y%m%d')
+    end_date = datetime.strptime('20201007', '%Y%m%d')
+    dates = datelist(start_date, end_date)
+
+    with ThreadPoolExecutor(max_workers=3) as executor:
+        futures = {executor.submit(process_date, date): date for date in dates}
+        for future in as_completed(futures):
+            try:
+                future.result()
+            except Exception as e:
+                print(f"[ERROR] Task failed: {e}")
