@@ -1,0 +1,203 @@
+
+
+import os
+import re
+import logging
+import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
+from bs4 import BeautifulSoup
+from datetime import datetime, timedelta
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import threading
+import csv
+
+# --- 配置区域 ---
+SAVE_PATH = r"C:\Users\y\OneDrive\Research\PHD\Research\data\context analysis\xinwenlianbo20110406-20160202"
+CSV_FILE = os.path.join(SAVE_PATH, 'xinwenlianbo_20110406-20160202.csv')
+SUCCESS_LOG = os.path.join(SAVE_PATH, 'log_success.txt')
+ERROR_LOG = os.path.join(SAVE_PATH, 'log_error.txt')
+
+HEADERS = {
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115.0.0.0 Safari/537.36',
+}
+
+START_DATE = "2011-04-06"
+END_DATE = "2016-02-02"
+MAX_WORKERS = 10
+
+BASE_URL_FORMAT = "http://cctv.cntv.cn/lm/xinwenlianbo/{date}.shtml"
+log_lock = threading.Lock()
+csv_lock = threading.Lock()
+CSV_HEADER = ['date', 'title', 'url', 'status']
+
+
+# --- 日志初始化 ---
+def setup_logging():
+    logger = logging.getLogger()
+    logger.setLevel(logging.INFO)
+    if logger.hasHandlers():
+        logger.handlers.clear()
+
+    error_handler = logging.FileHandler(ERROR_LOG, 'a', 'utf-8')
+    error_handler.setLevel(logging.WARNING)
+    error_handler.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s'))
+    logger.addHandler(error_handler)
+
+    console_handler = logging.StreamHandler()
+    console_handler.setLevel(logging.INFO)
+    console_handler.setFormatter(logging.Formatter('%(message)s'))
+    logger.addHandler(console_handler)
+
+
+# --- 文件与状态处理 ---
+def load_completed_dates():
+    if not os.path.exists(SUCCESS_LOG):
+        return set()
+    with open(SUCCESS_LOG, 'r', encoding='utf-8') as f:
+        return {line.strip() for line in f}
+
+def record_success(date_str):
+    with log_lock:
+        with open(SUCCESS_LOG, 'a', encoding='utf-8') as f:
+            f.write(date_str + '\n')
+
+def create_retry_session(retries=3, backoff_factor=1.0, status_forcelist=(500, 502, 504)):
+    session = requests.Session()
+    retry = Retry(
+        total=retries,
+        read=retries,
+        connect=retries,
+        backoff_factor=backoff_factor,
+        status_forcelist=status_forcelist,
+        raise_on_status=False
+    )
+    adapter = HTTPAdapter(max_retries=retry)
+    session.mount('http://', adapter)
+    session.mount('https://', adapter)
+    return session
+
+
+def append_to_csv(data_rows):
+    with csv_lock:
+        try:
+            file_needs_header = not os.path.exists(CSV_FILE) or os.path.getsize(CSV_FILE) == 0
+            with open(CSV_FILE, 'a', newline='', encoding='utf-8-sig') as f:
+                writer = csv.DictWriter(f, fieldnames=CSV_HEADER)
+                if file_needs_header:
+                    writer.writeheader()
+                writer.writerows(data_rows)
+        except IOError as e:
+            logging.error(f"写入CSV文件失败: {CSV_FILE}, 错误: {e}")
+
+
+# --- 链接提取 ---
+def get_daily_links(session, date_str):
+    url = BASE_URL_FORMAT.format(date=date_str)
+    links = []
+    try:
+        response = session.get(url, headers=HEADERS, timeout=60)
+        raw_bytes = response.content
+
+        try:
+            text = raw_bytes.decode('utf-8')
+            soup = BeautifulSoup(text, 'html.parser')
+        except UnicodeDecodeError:
+            text = raw_bytes.decode('gbk', errors='replace')
+            soup = BeautifulSoup(text, 'html.parser')
+
+        content_div = soup.find('div', id=re.compile(r'contentELMT\d+'))
+        if content_div:
+            for a in content_div.find_all('a'):
+                if a.has_attr('href') and a.text:
+                    links.append({'title': a.text.strip(), 'url': a['href']})
+            if links: return links
+
+        matches = re.findall(r"item_01\[\d+\]=new title_array_01\('(.*?)','(.*?)'\);", text)
+        for title, link_url in matches:
+            links.append({'title': title.strip(), 'url': link_url})
+        return links
+
+    except requests.exceptions.RequestException as e:
+        logging.error(f"[{date_str}] 获取链接失败: {e}")
+        return []
+
+
+# --- 单日任务 ---
+def process_date(date_str_file):
+    date_str_url = date_str_file.replace('-', '')
+    logging.info(f"开始处理日期: {date_str_file}")
+
+    session = create_retry_session()
+    daily_links = get_daily_links(session, date_str_url)
+
+    if not daily_links:
+        logging.warning(f"【跳过】日期 {date_str_file} 没有新闻链接。")
+        return [], False
+
+    all_article_data = []
+    for item in daily_links:
+        time.sleep(0.1)
+        row = {
+            'date': date_str_file,
+            'title': item['title'],
+            'url': item['url'],
+            'status': 'success' if item['url'].startswith('http') else 'invalid_url'
+        }
+        all_article_data.append(row)
+
+    logging.info(f"完成日期 {date_str_file}，共 {len(all_article_data)} 条。")
+    return all_article_data, True
+
+
+# --- 主入口 ---
+def main():
+    os.makedirs(SAVE_PATH, exist_ok=True)
+    setup_logging()
+
+    completed_dates = load_completed_dates()
+    dates_to_process = []
+    current_dt = datetime.strptime(START_DATE, "%Y-%m-%d")
+    end_dt = datetime.strptime(END_DATE, "%Y-%m-%d")
+    while current_dt <= end_dt:
+        date_str = current_dt.strftime("%Y-%m-%d")
+        if date_str not in completed_dates:
+            dates_to_process.append(date_str)
+        current_dt += timedelta(days=1)
+
+    if not dates_to_process:
+        logging.info("所有日期已完成，无需处理。")
+        return
+
+    logging.info(f"任务开始：共需处理 {len(dates_to_process)} 天")
+
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+        future_to_date = {executor.submit(process_date, d): d for d in dates_to_process}
+        success_count, fail_count = 0, 0
+
+        for future in as_completed(future_to_date):
+            date_str = future_to_date[future]
+            try:
+                article_data_list, success = future.result()
+                if success:
+                    if article_data_list:
+                        append_to_csv(article_data_list)
+                    record_success(date_str)
+                    success_count += 1
+                else:
+                    fail_count += 1
+            except Exception as e:
+                fail_count += 1
+                logging.error(f"处理日期 {date_str} 失败: {e}", exc_info=True)
+
+    logging.info("\n" + "=" * 50)
+    logging.info("全部任务完成！")
+    logging.info(f"成功处理天数: {success_count}")
+    logging.info(f"失败或跳过天数: {fail_count}（查看 {os.path.basename(ERROR_LOG)}）")
+    logging.info(f"CSV 文件保存于: {CSV_FILE}")
+    logging.info("=" * 50)
+
+
+if __name__ == "__main__":
+    main()
